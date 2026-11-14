@@ -4,7 +4,7 @@ import { tombstone, type Connection } from '../homeassistant'
 import { type Metadata } from '../thinq'
 import { allowExtendedType } from '@/util/casting'
 import AABBDevice from './aabb_device'
-import { ERRORS, COURSES, TEMPERATURES, SPINS, SOIL_LEVELS } from './washer_common'
+import { ERRORS, COURSES, TEMPERATURES, SPINS, SOIL_LEVELS, RINSES } from './washer_common'
 import { Enum } from '@/util/enum'
 
 // Codes derived from modelJSON & observation of the LG app.
@@ -139,6 +139,15 @@ export default class Device extends AABBDevice {
                         icon: 'mdi:autorenew',
                         device_class: 'enum',
                         options: SPINS.options,
+                    },
+                    rinse: {
+                        platform: 'sensor',
+                        unique_id: '$deviceid-rinse',
+                        state_topic: '$this/rinse',
+                        name: 'Rinse',
+                        icon: 'mdi:water',
+                        device_class: 'enum',
+                        options: RINSES.options,
                     },
                     cycles: {
                         platform: 'sensor',
@@ -349,8 +358,15 @@ export default class Device extends AABBDevice {
         this.publishProperty('prewash', options & 0x40 ? 'ON' : 'OFF')
         this.publishProperty('steam', options & 0x80 ? 'ON' : 'OFF')
         this.publishProperty('soil', SOIL_LEVELS.map(soil))
+        this.publishProperty('rinse', RINSES.map(extra_rinse))
 
         // buf[22] is the downloaded programme actually selected, buf[25] the one in the download slot.
+        // Choices staged for one programme mean nothing for another, so a different programme being
+        // selected, or loaded into the slot, drops them.
+        const previous = this.reported
+        if (previous && (previous.course !== course || previous.selected !== buf[22] || previous.slot !== buf[25])) {
+            this.pending.clear()
+        }
         this.reported = {
             course,
             soil,

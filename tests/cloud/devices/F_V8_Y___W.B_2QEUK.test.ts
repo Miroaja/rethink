@@ -234,6 +234,25 @@ describe(MODEL_ID, () => {
             assert.equal(lastSent(thinq), DOWNLOAD_NO_OPTIONS)
         })
 
+        test('the rinse level is read back under the same labels as the select', () => {
+            const { ha, thinq } = makeDevice()
+            thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+            assert.equal(ha.devices[DEVICE_ID].properties.rinse, 'Rinse+')
+            thinq.emit('data', SAMPLE_COTTON_STD)
+            assert.equal(ha.devices[DEVICE_ID].properties.rinse, 'Normal')
+        })
+
+        test('staged choices survive the same programme being reported again, not a different one', () => {
+            const { ha, thinq, dev } = makeDevice()
+            thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+            dev.setProperty('set_steam', 'ON')
+            thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+            assert.equal(ha.devices[DEVICE_ID].properties.set_steam, 'ON')
+
+            thinq.emit('data', SAMPLE_COTTON_STD) // another course selected, another slot content
+            assert.equal(ha.devices[DEVICE_ID].properties.set_steam, 'OFF')
+        })
+
         test('nothing is sent before the appliance has reported', () => {
             const { thinq, dev } = makeDevice()
             thinq.resetRecorder()
