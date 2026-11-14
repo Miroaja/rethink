@@ -4,7 +4,7 @@ import { tombstone, type Connection } from '../homeassistant'
 import { type Metadata } from '../thinq'
 import { allowExtendedType } from '@/util/casting'
 import AABBDevice from './aabb_device'
-import { ERRORS, COURSES, TEMPERATURES, SPINS, SOIL_LEVELS, RINSES } from './washer_common'
+import { ERRORS, COURSES, TEMPERATURES, SPINS, SOIL_LEVELS, RINSES, SMART_COURSES } from './washer_common'
 import { Enum } from '@/util/enum'
 
 // Codes derived from modelJSON & observation of the LG app.
@@ -44,6 +44,25 @@ const OPTION_BITS: Record<string, number> = {
     prewash: 0x40,
     steam: 0x80,
 }
+
+// Downloadable programmes that sit on the Cotton course according to modelJson, under the IDs the
+// shared SMART_COURSES table gives them. Sweat Stain and Cold Wash are the two seen in this model's
+// download slot.
+const COTTON = 0x01
+const COTTON_PROGRAMMES = new Set(
+    [
+        'Baby Care',
+        'Skin Care',
+        'Cold Wash',
+        'Kids Wear',
+        'Rainy Season',
+        'Sweat Stain',
+        'Minimize Wrinkles',
+        'Minimize Detergent Residue',
+        'Sleeve Hems and Collars',
+        'Juice and Food Stains',
+    ].flatMap((name) => SMART_COURSES.unmap(name) ?? []),
+)
 
 export default class Device extends AABBDevice {
     // F025 downloads a programme into the appliance's single download slot and F026 runs one. Both
@@ -440,17 +459,21 @@ export default class Device extends AABBDevice {
     }
 
     /**
-     * The last report, if the downloaded programme is the one the appliance has selected. Both
-     * commands below describe that programme: the course byte is the base of whatever is selected,
-     * and pairing it with a different programme's ID is unconfirmed.
+     * The course and ID to put in a record, if the downloaded programme is one the commands below
+     * may describe. Normally that is the programme the appliance has selected, whose base course it
+     * reports. A freshly woken appliance reports no selection and no settings, and selects the
+     * downloaded programme when one arrives; its base course is then known only for the Cotton
+     * based programmes, which is all `woken` lets through. Pairing a course with another
+     * programme's ID is unconfirmed.
      */
-    private downloaded(what: string) {
+    private downloaded(what: string, woken = false) {
         const r = this.reported
-        if (r === undefined || r.selected === 0 || r.selected !== r.slot) {
-            this.log(`ignoring ${what}, the downloaded programme is not the selected one`)
-            return undefined
+        if (r !== undefined && r.selected !== 0 && r.selected === r.slot) return { course: r.course, id: r.slot }
+        if (r !== undefined && woken && r.selected === 0 && COTTON_PROGRAMMES.has(r.slot)) {
+            return { course: COTTON, id: r.slot }
         }
-        return r
+        this.log(`ignoring ${what}, the downloaded programme is not the selected one`)
+        return undefined
     }
 
     /**
@@ -467,18 +490,27 @@ export default class Device extends AABBDevice {
      * app does.
      */
     private downloadCommand() {
-        const r = this.downloaded('download')
-        if (r === undefined) return undefined
+        const target = this.downloaded('download', true)
+        if (target === undefined) return undefined
+        const soil = this.setting('soil')
+        const spin = this.setting('spin')
+        const temp = this.setting('temp')
+        const rinse = this.setting('rinse')
+        // 0 is what an appliance that has just woken reports for each of these: no choice made.
+        if (!soil || !spin || !temp || !rinse) {
+            this.log('ignoring download, a setting is neither reported nor chosen')
+            return undefined
+        }
         return Buffer.from([
             0xf0,
             0x25,
             0x03,
             0x15,
-            r.course,
-            this.setting('soil')!,
-            this.setting('spin')!,
-            this.setting('temp')!,
-            this.setting('rinse')!,
+            target.course,
+            soil,
+            spin,
+            temp,
+            rinse,
             0, // dryLevel
             0, // reserveTimeHour
             0, // reserveTimeMinute
@@ -486,7 +518,7 @@ export default class Device extends AABBDevice {
             this.setting('options')!,
             0, // flags
             0,
-            r.slot,
+            target.id,
             0,
             0,
             0,
@@ -506,12 +538,12 @@ export default class Device extends AABBDevice {
      * downloaded programme has been seen running on this model, so that is all this runs.
      */
     private programmeCommand() {
-        const r = this.downloaded('run')
-        if (r === undefined) return undefined
+        const target = this.downloaded('run')
+        if (target === undefined) return undefined
         return Buffer.from([
             0xf0,
             0x26,
-            r.course,
+            target.course,
             this.setting('soil')!,
             this.setting('spin')!,
             this.setting('temp')!,
@@ -523,7 +555,7 @@ export default class Device extends AABBDevice {
             this.setting('options')!,
             0x03, // initialBit | remoteStart
             0,
-            r.selected,
+            target.id,
             0,
             0,
             0,
@@ -544,21 +576,25 @@ export default class Device extends AABBDevice {
 
         if (prop === 'download_programme') {
             const command = this.downloadCommand()
-            if (command) this.send(command)
-            // The appliance is the authority on what it holds now; drop the choices so the entities
-            // follow it again, which also shows a download it refused. A delay is not part of a
-            // download, so it stays for the run.
-            for (const setting of ['soil', 'spin', 'temp', 'rinse', 'options']) this.pending.delete(setting)
-            this.publishSettings()
+            if (command) {
+                this.send(command)
+                // The appliance is the authority on what it holds now; drop the choices so the entities
+                // follow it again, which also shows a download it ignored. A delay is not part of a
+                // download, so it stays for the run. A refused download leaves everything staged.
+                for (const setting of ['soil', 'spin', 'temp', 'rinse', 'options']) this.pending.delete(setting)
+                this.publishSettings()
+            }
             return
         }
 
         if (prop === 'run_programme') {
             const command = this.programmeCommand()
-            if (command) this.send(command)
-            // As above, with the delay used up as well.
-            this.pending.clear()
-            this.publishSettings()
+            if (command) {
+                this.send(command)
+                // As above, with the delay used up as well.
+                this.pending.clear()
+                this.publishSettings()
+            }
             return
         }
 

@@ -79,6 +79,18 @@ const DELAY_COUNTDOWN_STATUS = buf(
     'aa5420ec002503012301230100030506020003000040210001043b27003b000004000000000000000000000025030123012301000305060200023b0040210001043b27003b000004000000000000000000000fbb',
 )
 
+// The washer switched on at the panel: standby, no programme selected, no settings reported, and
+// the downloaded programme still in the slot. The download at DOWNLOAD_SOIL_INTENSIVE, sent in
+// this state, selected the programme and set it up.
+const WOKEN_STATUS = buf(
+    'aa5420ec002500000000000000000000000000000000000000010000003b00000000000000000000000000002501000000000000000000000000000000000000000027003b00000000000000000000000000a6bb',
+)
+
+// The same unit while it was off and its reports were being restarted, with the slot empty.
+const EMPTY_SLOT_STATUS = buf(
+    'aa5420ec002500040304030000000000000000000000010004010027003b0000010000000000000000000000250000000000000000000000000000000000000001000000000000000000000000000000000099bb',
+)
+
 // Downloads as above, 800 rpm and 60 °C, with one setting changed from the baseline's soil Normal
 // and Rinse+, as the washer then reported it.
 const DOWNLOAD_SOIL_INTENSIVE = 'AA18F02503150104050602000000000000003B00000069BB'
@@ -326,6 +338,35 @@ describe(MODEL_ID, () => {
             assert.equal(ha.devices[DEVICE_ID].properties.reserve_time, 2 * 60 + 59)
         })
 
+        test('right after a wake, a download needs every setting chosen first', () => {
+            const { thinq, dev } = makeDevice()
+            thinq.emit('data', WOKEN_STATUS)
+            thinq.resetRecorder()
+
+            dev.setProperty('download_programme', '')
+            dev.setProperty('set_spin', '800 rpm')
+            dev.setProperty('set_temp', '60 °C')
+            dev.setProperty('download_programme', '')
+            assert.equal(thinq.outbox.length, 0)
+
+            dev.setProperty('set_soil', 'Intensive')
+            dev.setProperty('set_rinse', 'Rinse+')
+            dev.setProperty('download_programme', '')
+            assert.equal(lastSent(thinq), DOWNLOAD_SOIL_INTENSIVE)
+        })
+
+        test('nothing is downloaded while the slot is empty', () => {
+            const { thinq, dev } = makeDevice()
+            thinq.emit('data', EMPTY_SLOT_STATUS)
+            thinq.resetRecorder()
+            dev.setProperty('set_soil', 'Intensive')
+            dev.setProperty('set_spin', '800 rpm')
+            dev.setProperty('set_temp', '60 °C')
+            dev.setProperty('set_rinse', 'Rinse+')
+            dev.setProperty('download_programme', '')
+            assert.equal(thinq.outbox.length, 0)
+        })
+
         test('nothing is sent before the appliance has reported', () => {
             const { thinq, dev } = makeDevice()
             thinq.resetRecorder()
@@ -386,6 +427,18 @@ describe(MODEL_ID, () => {
             dev.setProperty('run_programme', '')
             assert.equal(delayOf(thinq), 3)
             assert.equal(ha.devices[DEVICE_ID].properties.set_delay_end, 0)
+        })
+
+        test('nothing runs before a programme has been selected', () => {
+            const { thinq, dev } = makeDevice()
+            thinq.emit('data', WOKEN_STATUS)
+            thinq.resetRecorder()
+            dev.setProperty('set_soil', 'Intensive')
+            dev.setProperty('set_spin', '800 rpm')
+            dev.setProperty('set_temp', '60 °C')
+            dev.setProperty('set_rinse', 'Rinse+')
+            dev.setProperty('run_programme', '')
+            assert.equal(thinq.outbox.length, 0)
         })
 
         test('nothing runs while the downloaded programme is not the selected one', () => {
