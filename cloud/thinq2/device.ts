@@ -1,7 +1,7 @@
 // This class handles the devices connecting to the internal MQTT broker. This includes both device provisioning
 // and minimal wrappers for actual data exchange. The device class is responsible for generating/parsing the payload.
 
-import { generateDeployResponse } from './provisioning'
+import { generateDeployResponse, generateNewProvisioning } from './provisioning'
 import { TypedEmitter } from 'tiny-typed-emitter'
 import { Client, type Broker } from '../mqtt-broker'
 import { ClipDeployMessage, ClipRxMessage, ClipPayload, DeployAppInfo, DeployPlatformInfo } from './clip'
@@ -74,6 +74,10 @@ type ClientWithExtra = Client & {
     deployMsg: undefined | ClipDeployMessage
 }
 
+// The real cloud sends newProvisioning about this long after a preDeploy. Whether the delay matters
+// is untested.
+const NEW_PROVISIONING_DELAY_MS = 4000
+
 type DeviceAcceptorEvents = {
     newDevice: (dev: Device) => void
     dropDevice: (id: string) => void
@@ -81,6 +85,8 @@ type DeviceAcceptorEvents = {
 
 export class DeviceAcceptor extends TypedEmitter<DeviceAcceptorEvents> {
     clientsById: Record<string, Client> = {}
+    // One entry per connection that sent a preDeploy; the timer is cleared once it has fired.
+    private newProvisioningTimers = new Map<Client, NodeJS.Timeout | undefined>()
     constructor(readonly broker: Broker) {
         super()
 
@@ -139,8 +145,35 @@ export class DeviceAcceptor extends TypedEmitter<DeviceAcceptorEvents> {
 
                 if (!client.deviceObj) this.completeProvisioning(payload.did, client.deployMsg, client)
                 else console.warn(`device ${payload.did} already set up`)
+
+                if (payload.cmd === 'preDeploy') this.scheduleNewProvisioning(payload.did, client)
             }
         }
+    }
+
+    // A device that was never registered with the LG cloud sends preDeploy, and the cloud follows its
+    // completeProvisioning with newProvisioning. Without it the device never finishes provisioning:
+    // after a few minutes it undeploys, switches its Wi-Fi off and forgets the network. With it, it
+    // answers deploy, and reconnects with deploy from then on. Sent on a timer, not on
+    // completeProvisioning_ack, because some devices never send the ack. See anszom/rethink#317.
+    scheduleNewProvisioning(deviceId: string, client: ClientWithExtra) {
+        if (this.newProvisioningTimers.has(client)) return
+
+        const timer = setTimeout(() => {
+            this.newProvisioningTimers.set(client, undefined)
+            log('status', `sending newProvisioning to ${deviceId}`)
+            this.broker.publish(
+                {
+                    topic: 'lime/devices/' + deviceId,
+                    retain: false,
+                    qos: 0,
+                    dup: false,
+                    payload: JSON.stringify(generateNewProvisioning(deviceId)),
+                },
+                null,
+            )
+        }, NEW_PROVISIONING_DELAY_MS)
+        this.newProvisioningTimers.set(client, timer)
     }
 
     completeProvisioning(deviceId: string, deployMsg: ClipDeployMessage, client: ClientWithExtra) {
@@ -199,6 +232,8 @@ export class DeviceAcceptor extends TypedEmitter<DeviceAcceptorEvents> {
 
     disconnected(_client: Client) {
         let client = _client as ClientWithExtra
+        clearTimeout(this.newProvisioningTimers.get(client))
+        this.newProvisioningTimers.delete(client)
         if (client.deviceObj) {
             delete this.clientsById[client.deviceObj.id]
             this.emit('dropDevice', client.deviceObj.id)

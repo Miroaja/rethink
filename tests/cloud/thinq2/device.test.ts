@@ -4,6 +4,7 @@ import { Broker } from '@/cloud/mqtt-broker'
 import { Device, DeviceAcceptor, deployMetadata } from '@/cloud/thinq2/device'
 import { fromRxPacket, type ClipDeployMessage, type DeployAppInfo } from '@/cloud/thinq2/clip'
 import { allowExtendedType } from '@/util/casting'
+import { enableMockTimers, tickMockTimers } from '@/tests/helpers/timers'
 
 function deploy(appInfo: Partial<DeployAppInfo>): ClipDeployMessage {
     return {
@@ -149,5 +150,70 @@ describe('ThinQ2 device identity', () => {
         acceptor.mqtt('clip/message/devices/some-other-device', { ...STATUS_CAPTURE, did: 'another-device' }, client)
 
         assert.equal(received, false)
+    })
+})
+
+describe('ThinQ2 newProvisioning', () => {
+    type Sent = { topic: string; retain: boolean; payload: any }
+
+    function provision(cmd: 'preDeploy' | 'deploy') {
+        const acceptor = new DeviceAcceptor(new Broker())
+        const sent: Sent[] = []
+        acceptor.broker.on('publish', (packet, from) => {
+            if (!from)
+                sent.push({
+                    topic: packet.topic,
+                    retain: packet.retain,
+                    payload: JSON.parse(packet.payload.toString()),
+                })
+        })
+        const client = {} as any
+        // Deliberate synthetic mutation of the captured message: its cmd, so a deploy arrives as a preDeploy.
+        const message = { ...structuredClone(DEPLOY_CAPTURE), cmd }
+        acceptor.mqtt(`clip/provisioning/devices/${deviceId}`, message, client)
+        return { acceptor, client, message, sent }
+    }
+    const newProvisioningOf = (sent: Sent[]) => sent.filter((m) => m.payload.cmd === 'newProvisioning')
+
+    test('a preDeploy is followed by newProvisioning after the cloud delay, and not before', (t) => {
+        enableMockTimers(t)
+        const { sent } = provision('preDeploy')
+        assert.ok(sent.some((m) => m.payload.cmd === 'completeProvisioning'))
+
+        tickMockTimers(t, 3900)
+        assert.equal(newProvisioningOf(sent).length, 0)
+
+        tickMockTimers(t, 100)
+        const [message, ...more] = newProvisioningOf(sent)
+        assert.equal(more.length, 0)
+        assert.equal(message.topic, `lime/devices/${deviceId}`)
+        assert.equal(message.retain, false)
+        // As the LG cloud sent it in the bridge capture in anszom/rethink#317; the device ID is replaced.
+        assert.deepEqual(message.payload, { did: deviceId, mid: 0, cmd: 'newProvisioning', type: 0, data: null })
+    })
+
+    test('a device that is already registered is not sent it', (t) => {
+        enableMockTimers(t)
+        const { sent } = provision('deploy')
+        tickMockTimers(t, 60_000)
+        assert.equal(newProvisioningOf(sent).length, 0)
+    })
+
+    test('a connection that repeats its preDeploy is sent it once', (t) => {
+        enableMockTimers(t)
+        const { acceptor, client, message, sent } = provision('preDeploy')
+        acceptor.mqtt(`clip/provisioning/devices/${deviceId}`, structuredClone(message), client)
+        tickMockTimers(t, 10_000)
+        acceptor.mqtt(`clip/provisioning/devices/${deviceId}`, structuredClone(message), client)
+        tickMockTimers(t, 10_000)
+        assert.equal(newProvisioningOf(sent).length, 1)
+    })
+
+    test('a connection that drops before the delay is not sent it', (t) => {
+        enableMockTimers(t)
+        const { acceptor, client, sent } = provision('preDeploy')
+        acceptor.disconnected(client)
+        tickMockTimers(t, 60_000)
+        assert.equal(newProvisioningOf(sent).length, 0)
     })
 })

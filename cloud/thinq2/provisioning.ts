@@ -77,3 +77,7 @@ export function generateDeployResponse(payload: ClipDeployMessage) {
         },
     }
 }
+
+export function generateNewProvisioning(deviceId: string) {
+    return { did: deviceId, mid: 0, cmd: 'newProvisioning', type: 0, data: null }
+}
