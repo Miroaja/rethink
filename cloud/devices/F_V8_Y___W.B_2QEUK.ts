@@ -28,7 +28,36 @@ const STATUS = Enum.of({
     Error: 18,
 })
 
+// What the Cotton course (the base of the downloadable programmes seen so far) offers in this
+// model's modelJson, under the labels the sensors above already use. 800 rpm, Max, 40 and 60 °C,
+// Normal and Rinse+ were each confirmed on a unit; the rest is as LG declares it.
+const SETTABLE_TEMPERATURES = Enum.of({ Cold: 1, '20 °C': 2, '30 °C': 3, '40 °C': 4, '60 °C': 6, '95 °C': 7 })
+const SETTABLE_SPINS = Enum.of({ 'No spin': 1, '400 rpm': 2, '800 rpm': 5, '1000 rpm': 7, Max: 255 })
+const SETTABLE_RINSES = Enum.of({ Normal: 1, 'Rinse+': 2 })
+
+// Bit positions in the options byte, both in a programme record and in the status block.
+const OPTION_BITS: Record<string, number> = {
+    turbowash: 0x01,
+    prewash: 0x40,
+    steam: 0x80,
+}
+
 export default class Device extends AABBDevice {
+    // F025 downloads a programme into the appliance's single download slot. Unlike a start, it
+    // configures without running, so the choices made through the set_* entities are held here
+    // until the download button is pressed, each defaulting to what the appliance last reported.
+    private pending = new Map<string, number>()
+    private reported?: {
+        course: number
+        soil: number
+        spin: number
+        temp: number
+        rinse: number
+        options: number
+        selected: number
+        slot: number
+    }
+
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq, false)
         this.setConfig(
@@ -212,6 +241,65 @@ export default class Device extends AABBDevice {
                         name: 'Steam',
                         icon: 'mdi:kettle-steam',
                     },
+                    set_temp: {
+                        platform: 'select',
+                        unique_id: '$deviceid-set_temp',
+                        state_topic: '$this/set_temp',
+                        command_topic: '$this/set_temp/set',
+                        name: 'Set temperature',
+                        icon: 'mdi:thermometer',
+                        options: SETTABLE_TEMPERATURES.options,
+                    },
+                    set_spin: {
+                        platform: 'select',
+                        unique_id: '$deviceid-set_spin',
+                        state_topic: '$this/set_spin',
+                        command_topic: '$this/set_spin/set',
+                        name: 'Set spin',
+                        icon: 'mdi:autorenew',
+                        options: SETTABLE_SPINS.options,
+                    },
+                    set_rinse: {
+                        platform: 'select',
+                        unique_id: '$deviceid-set_rinse',
+                        state_topic: '$this/set_rinse',
+                        command_topic: '$this/set_rinse/set',
+                        name: 'Set rinse',
+                        icon: 'mdi:water',
+                        options: SETTABLE_RINSES.options,
+                    },
+                    set_steam: {
+                        platform: 'switch',
+                        unique_id: '$deviceid-set_steam',
+                        state_topic: '$this/set_steam',
+                        command_topic: '$this/set_steam/set',
+                        name: 'Set steam',
+                        icon: 'mdi:kettle-steam',
+                    },
+                    set_prewash: {
+                        platform: 'switch',
+                        unique_id: '$deviceid-set_prewash',
+                        state_topic: '$this/set_prewash',
+                        command_topic: '$this/set_prewash/set',
+                        name: 'Set pre-wash',
+                        icon: 'mdi:water-sync',
+                    },
+                    set_turbowash: {
+                        platform: 'switch',
+                        unique_id: '$deviceid-set_turbowash',
+                        state_topic: '$this/set_turbowash',
+                        command_topic: '$this/set_turbowash/set',
+                        name: 'Set TurboWash',
+                        icon: 'mdi:rocket-launch',
+                    },
+                    download_programme: {
+                        platform: 'button',
+                        unique_id: '$deviceid-download_programme',
+                        command_topic: '$this/download_programme/set',
+                        payload_press: '',
+                        name: 'Download programme',
+                        icon: 'mdi:download-box-outline',
+                    },
                 },
             }),
         )
@@ -261,6 +349,84 @@ export default class Device extends AABBDevice {
         this.publishProperty('prewash', options & 0x40 ? 'ON' : 'OFF')
         this.publishProperty('steam', options & 0x80 ? 'ON' : 'OFF')
         this.publishProperty('soil', SOIL_LEVELS.map(soil))
+
+        // buf[22] is the downloaded programme actually selected, buf[25] the one in the download slot.
+        this.reported = {
+            course,
+            soil,
+            spin,
+            temp,
+            rinse: extra_rinse,
+            options,
+            selected: buf[22],
+            slot: buf[25],
+        }
+        this.publishSettings()
+    }
+
+    /** A setting's effective value: what the user chose, or failing that what the appliance reports. */
+    private setting(prop: 'spin' | 'temp' | 'rinse' | 'options') {
+        return this.pending.get(prop) ?? this.reported?.[prop]
+    }
+
+    /** Republish every set_* entity. Called on each status block and after each choice. */
+    private publishSettings() {
+        const temp = this.setting('temp')
+        const spin = this.setting('spin')
+        const rinse = this.setting('rinse')
+        const options = this.setting('options')
+        // Codes outside the selectable lists (an idle appliance reports 0) publish as 'None'.
+        this.publishProperty('set_temp', temp === undefined ? undefined : SETTABLE_TEMPERATURES.map(temp))
+        this.publishProperty('set_spin', spin === undefined ? undefined : SETTABLE_SPINS.map(spin))
+        this.publishProperty('set_rinse', rinse === undefined ? undefined : SETTABLE_RINSES.map(rinse))
+        for (const [name, bit] of Object.entries(OPTION_BITS)) {
+            this.publishProperty(`set_${name}`, (options ?? 0) & bit ? 'ON' : 'OFF')
+        }
+    }
+
+    /**
+     * F0 25 03 15 <course> <soilWash> <spin> <temp> <rinse> <dryLevel> <reserveH> <reserveM>
+     *             <loadItem> <options> <flags> 00 <smartCourse> 00 00 00
+     *
+     * The record after 03 15 is the one F026 carries to start a programme. Confirmed against a
+     * download issued from the LG app (Sweat Stain, whose course, soilWash, spin, temp and rinse
+     * bytes are modelJson's defaults for it), and by changing each setting from HA and reading
+     * the status block back. 03 15 is the download type and the data length from modelJson's
+     * WMDownload; the length is not the 16 bytes that follow, and is sent as the app sends it.
+     *
+     * The record describes the downloaded programme, so it is only built while that is the
+     * programme the appliance has selected: the course byte is the base of whatever is selected,
+     * and pairing it with a different programme's ID is unconfirmed. dryLevel, the delay and
+     * loadItem fields did nothing in a download and are sent as 0, as the app does.
+     */
+    private downloadCommand() {
+        const r = this.reported
+        if (r === undefined || r.selected === 0 || r.selected !== r.slot) {
+            this.log('ignoring download, the downloaded programme is not the selected one')
+            return undefined
+        }
+        return Buffer.from([
+            0xf0,
+            0x25,
+            0x03,
+            0x15,
+            r.course,
+            r.soil,
+            this.setting('spin')!,
+            this.setting('temp')!,
+            this.setting('rinse')!,
+            0, // dryLevel
+            0, // reserveTimeHour
+            0, // reserveTimeMinute
+            0, // loadItemWasher
+            this.setting('options')!,
+            0, // flags
+            0,
+            r.slot,
+            0,
+            0,
+            0,
+        ])
     }
 
     setProperty(prop: string, mqttValue: string) {
@@ -274,5 +440,35 @@ export default class Device extends AABBDevice {
 
         if (prop === 'pause') this.send(Buffer.from('F024040100', 'hex'))
         if (prop === 'start') this.send(Buffer.from('F024050100', 'hex'))
+
+        if (prop === 'download_programme') {
+            const command = this.downloadCommand()
+            if (command) this.send(command)
+            // The appliance is the authority on what it holds now; drop the choices so the entities
+            // follow it again, which also shows a download it refused.
+            this.pending.clear()
+            this.publishSettings()
+            return
+        }
+
+        const selects: Record<string, [string, Enum<string>]> = {
+            set_temp: ['temp', SETTABLE_TEMPERATURES],
+            set_spin: ['spin', SETTABLE_SPINS],
+            set_rinse: ['rinse', SETTABLE_RINSES],
+        }
+        if (prop in selects) {
+            const [setting, table] = selects[prop]
+            const code = table.unmap(mqttValue)
+            if (code !== undefined) this.pending.set(setting, code)
+            this.publishSettings()
+            return
+        }
+
+        const bit = OPTION_BITS[prop.slice(4)]
+        if (prop.startsWith('set_') && bit !== undefined) {
+            const options = this.setting('options') ?? 0
+            this.pending.set('options', mqttValue === 'ON' ? options | bit : options & ~bit)
+            this.publishSettings()
+        }
     }
 }
