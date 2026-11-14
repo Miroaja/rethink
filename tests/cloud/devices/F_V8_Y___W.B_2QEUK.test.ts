@@ -66,6 +66,32 @@ const DOWNLOAD_STEAM = 'AA18F02503150103050602000000008000003B000000EEBB'
 // All three options at once; the LG app showed each of them on.
 const DOWNLOAD_ALL_OPTIONS = 'AA18F0250315010305060200000000C100003B000000A9BB'
 
+// The same unit, later. Each status block is the washer's report after a packet from the
+// monitor: a download with soil level Intensive, one with the rinse set to Normal + Hold, and a
+// delayed start of three hours, reported with 2:59 of it left.
+const SOIL_INTENSIVE_STATUS = buf(
+    'aa5420ec002501000000000000000000000000000000000000000027003b00000000000000000000000000002501041b041b0100040506020000000000010004003b27003b00000500000000000000000000fabb',
+)
+const RINSE_NORMAL_HOLD_STATUS = buf(
+    'aa5420ec002501041104110100030506030000000000010004003b27003b00000500000000000000000000002501033103310100030506040000000000010004003b27003b000004000000000000000000000fbb',
+)
+const DELAY_COUNTDOWN_STATUS = buf(
+    'aa5420ec002503012301230100030506020003000040210001043b27003b000004000000000000000000000025030123012301000305060200023b0040210001043b27003b000004000000000000000000000fbb',
+)
+
+// Downloads as above, 800 rpm and 60 °C, with one setting changed from the baseline's soil Normal
+// and Rinse+, as the washer then reported it.
+const DOWNLOAD_SOIL_INTENSIVE = 'AA18F02503150104050602000000000000003B00000069BB'
+const DOWNLOAD_SOIL_TIME_SAVE = 'AA18F02503150102050602000000000000003B0000006FBB'
+const DOWNLOAD_SOIL_TURBOWASH = 'AA18F02503150101050602000000000000003B0000006CBB'
+const DOWNLOAD_RINSE_PLUSPLUS = 'AA18F02503150103050603000000000000003B00000069BB'
+const DOWNLOAD_RINSE_NORMAL_HOLD = 'AA18F02503150103050604000000000000003B00000068BB'
+const DOWNLOAD_RINSE_PLUS_HOLD = 'AA18F02503150103050605000000000000003B0000006BBB'
+
+// The programme above started with a three hour delay; the washer acknowledged it and went to
+// Delayed.
+const START_DELAYED_3H = 'AA16F0260103050602000300000003003B0000007DBB'
+
 function makeDevice() {
     const ha = new MockHAConnection()
     const thinq = new MockThinq2Device(DEVICE_ID, META)
@@ -253,6 +279,53 @@ describe(MODEL_ID, () => {
             assert.equal(ha.devices[DEVICE_ID].properties.set_steam, 'OFF')
         })
 
+        test('soil levels are read back and sent as the LG app shows them', () => {
+            const { ha, thinq, dev } = makeDevice()
+            thinq.emit('data', SOIL_INTENSIVE_STATUS)
+            assert.equal(ha.devices[DEVICE_ID].properties.soil, 'Intensive')
+            assert.equal(ha.devices[DEVICE_ID].properties.set_soil, 'Intensive')
+
+            const cases: [string, string][] = [
+                ['Intensive', DOWNLOAD_SOIL_INTENSIVE],
+                ['Time save', DOWNLOAD_SOIL_TIME_SAVE],
+                ['TurboWash', DOWNLOAD_SOIL_TURBOWASH],
+            ]
+            for (const [soil, packet] of cases) {
+                thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+                thinq.resetRecorder()
+                dev.setProperty('set_soil', soil)
+                dev.setProperty('download_programme', '')
+                assert.equal(lastSent(thinq), packet, soil)
+            }
+        })
+
+        test('every rinse level is read back and sent as the LG app shows it', () => {
+            const { ha, thinq, dev } = makeDevice()
+            thinq.emit('data', RINSE_NORMAL_HOLD_STATUS)
+            assert.equal(ha.devices[DEVICE_ID].properties.rinse, 'Normal + Hold')
+            assert.equal(ha.devices[DEVICE_ID].properties.set_rinse, 'Normal + Hold')
+
+            const cases: [string, string][] = [
+                ['Rinse++', DOWNLOAD_RINSE_PLUSPLUS],
+                ['Normal + Hold', DOWNLOAD_RINSE_NORMAL_HOLD],
+                ['Rinse+ + Hold', DOWNLOAD_RINSE_PLUS_HOLD],
+            ]
+            for (const [rinse, packet] of cases) {
+                thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+                thinq.resetRecorder()
+                dev.setProperty('set_rinse', rinse)
+                dev.setProperty('download_programme', '')
+                assert.equal(lastSent(thinq), packet, rinse)
+            }
+        })
+
+        test('the delay left is read as minutes', () => {
+            const { ha, thinq } = makeDevice()
+            thinq.emit('data', DELAY_COUNTDOWN_STATUS)
+            assert.equal(ha.devices[DEVICE_ID].properties.status, 'Delayed')
+            assert.equal(ha.devices[DEVICE_ID].properties.reserve_time, 2 * 60 + 59)
+        })
+
         test('nothing is sent before the appliance has reported', () => {
             const { thinq, dev } = makeDevice()
             thinq.resetRecorder()
@@ -265,6 +338,61 @@ describe(MODEL_ID, () => {
             thinq.emit('data', SAMPLE_COTTON_STD) // a dial course, with the slot holding another programme
             thinq.resetRecorder()
             dev.setProperty('download_programme', '')
+            assert.equal(thinq.outbox.length, 0)
+        })
+    })
+    describe('running a programme', () => {
+        function lastSent(thinq: MockThinq2Device) {
+            return hex(thinq.outbox[thinq.outbox.length - 1])
+        }
+
+        // packet[10] is the delay in hours: AA, length, F0, 26, then course, soil, spin, temp,
+        // rinse and dryLevel.
+        const delayOf = (thinq: MockThinq2Device) => thinq.outbox[thinq.outbox.length - 1][10]
+
+        test('the assembled command matches the delayed start the appliance accepted', () => {
+            const { thinq, dev } = makeDevice()
+            thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+            thinq.resetRecorder()
+            dev.setProperty('set_delay_end', '3')
+            dev.setProperty('run_programme', '')
+            assert.equal(lastSent(thinq), START_DELAYED_3H)
+        })
+
+        test('only a delay the appliance accepts is staged', () => {
+            const { thinq, dev } = makeDevice()
+            thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+            thinq.resetRecorder()
+
+            for (const invalid of ['1', '2', '20', '3.5', 'soon']) {
+                dev.setProperty('set_delay_end', invalid)
+                dev.setProperty('run_programme', '')
+                assert.equal(delayOf(thinq), 0, invalid)
+            }
+
+            dev.setProperty('set_delay_end', '19')
+            dev.setProperty('run_programme', '')
+            assert.equal(delayOf(thinq), 19)
+        })
+
+        test('a delay stays staged through a download and is spent by the run', () => {
+            const { ha, thinq, dev } = makeDevice()
+            thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+            dev.setProperty('set_delay_end', '3')
+            dev.setProperty('download_programme', '')
+            assert.equal(ha.devices[DEVICE_ID].properties.set_delay_end, 3)
+
+            thinq.resetRecorder()
+            dev.setProperty('run_programme', '')
+            assert.equal(delayOf(thinq), 3)
+            assert.equal(ha.devices[DEVICE_ID].properties.set_delay_end, 0)
+        })
+
+        test('nothing runs while the downloaded programme is not the selected one', () => {
+            const { thinq, dev } = makeDevice()
+            thinq.emit('data', SAMPLE_COTTON_STD)
+            thinq.resetRecorder()
+            dev.setProperty('run_programme', '')
             assert.equal(thinq.outbox.length, 0)
         })
     })

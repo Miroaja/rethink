@@ -29,11 +29,14 @@ const STATUS = Enum.of({
 })
 
 // What the Cotton course (the base of the downloadable programmes seen so far) offers in this
-// model's modelJson, under the labels the sensors above already use. 800 rpm, Max, 40 and 60 °C,
-// Normal and Rinse+ were each confirmed on a unit; the rest is as LG declares it.
+// model's modelJson, under the labels the sensors above already use. 800 rpm, Max, 40 and 60 °C
+// were confirmed on a unit, as was every rinse and soil level below, although the modelJson
+// lists only Normal and Rinse+ for the rinse and no choice at all for the soil. The rest is as
+// LG declares it.
 const SETTABLE_TEMPERATURES = Enum.of({ Cold: 1, '20 °C': 2, '30 °C': 3, '40 °C': 4, '60 °C': 6, '95 °C': 7 })
 const SETTABLE_SPINS = Enum.of({ 'No spin': 1, '400 rpm': 2, '800 rpm': 5, '1000 rpm': 7, Max: 255 })
-const SETTABLE_RINSES = Enum.of({ Normal: 1, 'Rinse+': 2 })
+const SETTABLE_RINSES = Enum.of({ Normal: 1, 'Rinse+': 2, 'Rinse++': 3, 'Normal + Hold': 4, 'Rinse+ + Hold': 5 })
+const SETTABLE_SOILS = Enum.of({ TurboWash: 1, 'Time save': 2, Normal: 3, Intensive: 4 })
 
 // Bit positions in the options byte, both in a programme record and in the status block.
 const OPTION_BITS: Record<string, number> = {
@@ -43,9 +46,9 @@ const OPTION_BITS: Record<string, number> = {
 }
 
 export default class Device extends AABBDevice {
-    // F025 downloads a programme into the appliance's single download slot. Unlike a start, it
-    // configures without running, so the choices made through the set_* entities are held here
-    // until the download button is pressed, each defaulting to what the appliance last reported.
+    // F025 downloads a programme into the appliance's single download slot and F026 runs one. Both
+    // carry every setting at once, so the choices made through the set_* entities are held here
+    // until a button is pressed, each defaulting to what the appliance last reported.
     private pending = new Map<string, number>()
     private reported?: {
         course: number
@@ -54,6 +57,7 @@ export default class Device extends AABBDevice {
         temp: number
         rinse: number
         options: number
+        delay_end: number
         selected: number
         slot: number
     }
@@ -208,7 +212,7 @@ export default class Device extends AABBDevice {
                         unique_id: '$deviceid-reserve_time',
                         state_topic: '$this/reserve_time',
                         device_class: 'duration',
-                        unit_of_measurement: 'h',
+                        unit_of_measurement: 'min',
                         name: 'Reserve time',
                         icon: 'mdi:timer-sand',
                     },
@@ -277,6 +281,15 @@ export default class Device extends AABBDevice {
                         icon: 'mdi:water',
                         options: SETTABLE_RINSES.options,
                     },
+                    set_soil: {
+                        platform: 'select',
+                        unique_id: '$deviceid-set_soil',
+                        state_topic: '$this/set_soil',
+                        command_topic: '$this/set_soil/set',
+                        name: 'Set soil level',
+                        icon: 'mdi:washing-machine',
+                        options: SETTABLE_SOILS.options,
+                    },
                     set_steam: {
                         platform: 'switch',
                         unique_id: '$deviceid-set_steam',
@@ -301,6 +314,19 @@ export default class Device extends AABBDevice {
                         name: 'Set TurboWash',
                         icon: 'mdi:rocket-launch',
                     },
+                    set_delay_end: {
+                        platform: 'number',
+                        unique_id: '$deviceid-set_delay_end',
+                        state_topic: '$this/set_delay_end',
+                        command_topic: '$this/set_delay_end/set',
+                        name: 'Set delayed end',
+                        icon: 'mdi:timer-sand',
+                        unit_of_measurement: 'h',
+                        // 0 is off; the appliance accepts 3..19 per modelJson's reserveTimeHour.
+                        min: 0,
+                        max: 19,
+                        step: 1,
+                    },
                     download_programme: {
                         platform: 'button',
                         unique_id: '$deviceid-download_programme',
@@ -308,6 +334,14 @@ export default class Device extends AABBDevice {
                         payload_press: '',
                         name: 'Download programme',
                         icon: 'mdi:download-box-outline',
+                    },
+                    run_programme: {
+                        platform: 'button',
+                        unique_id: '$deviceid-run_programme',
+                        command_topic: '$this/run_programme/set',
+                        payload_press: '',
+                        name: 'Run programme',
+                        icon: 'mdi:play-box-outline',
                     },
                 },
             }),
@@ -351,7 +385,8 @@ export default class Device extends AABBDevice {
         this.publishProperty('child_lock', !(lock_status & 0x80) ? 'ON' : 'OFF') // inverted logic, off=locked
         this.publishProperty('initial_time', time_initial)
         this.publishProperty('remaining_time', time_remain)
-        this.publishProperty('reserve_time', time_reserve_hour)
+        // buf[14] and buf[15] are the delay left as hours and minutes, counting down.
+        this.publishProperty('reserve_time', time_reserve_hour * 60 + buf[15])
         this.publishProperty('energy', energy)
         this.publishProperty('extra_rinse', extra_rinse >= 2 ? 'ON' : 'OFF') // 0/1=off, 2+=one or more extra rinses (Rinse+)
         this.publishProperty('turbowash', options & 0x01 ? 'ON' : 'OFF')
@@ -374,6 +409,7 @@ export default class Device extends AABBDevice {
             temp,
             rinse: extra_rinse,
             options,
+            delay_end: time_reserve_hour,
             selected: buf[22],
             slot: buf[25],
         }
@@ -381,23 +417,40 @@ export default class Device extends AABBDevice {
     }
 
     /** A setting's effective value: what the user chose, or failing that what the appliance reports. */
-    private setting(prop: 'spin' | 'temp' | 'rinse' | 'options') {
+    private setting(prop: 'soil' | 'spin' | 'temp' | 'rinse' | 'options' | 'delay_end') {
         return this.pending.get(prop) ?? this.reported?.[prop]
     }
 
     /** Republish every set_* entity. Called on each status block and after each choice. */
     private publishSettings() {
+        const soil = this.setting('soil')
         const temp = this.setting('temp')
         const spin = this.setting('spin')
         const rinse = this.setting('rinse')
         const options = this.setting('options')
         // Codes outside the selectable lists (an idle appliance reports 0) publish as 'None'.
+        this.publishProperty('set_soil', soil === undefined ? undefined : SETTABLE_SOILS.map(soil))
         this.publishProperty('set_temp', temp === undefined ? undefined : SETTABLE_TEMPERATURES.map(temp))
         this.publishProperty('set_spin', spin === undefined ? undefined : SETTABLE_SPINS.map(spin))
         this.publishProperty('set_rinse', rinse === undefined ? undefined : SETTABLE_RINSES.map(rinse))
+        this.publishProperty('set_delay_end', this.setting('delay_end'))
         for (const [name, bit] of Object.entries(OPTION_BITS)) {
             this.publishProperty(`set_${name}`, (options ?? 0) & bit ? 'ON' : 'OFF')
         }
+    }
+
+    /**
+     * The last report, if the downloaded programme is the one the appliance has selected. Both
+     * commands below describe that programme: the course byte is the base of whatever is selected,
+     * and pairing it with a different programme's ID is unconfirmed.
+     */
+    private downloaded(what: string) {
+        const r = this.reported
+        if (r === undefined || r.selected === 0 || r.selected !== r.slot) {
+            this.log(`ignoring ${what}, the downloaded programme is not the selected one`)
+            return undefined
+        }
+        return r
     }
 
     /**
@@ -410,24 +463,19 @@ export default class Device extends AABBDevice {
      * the status block back. 03 15 is the download type and the data length from modelJson's
      * WMDownload; the length is not the 16 bytes that follow, and is sent as the app sends it.
      *
-     * The record describes the downloaded programme, so it is only built while that is the
-     * programme the appliance has selected: the course byte is the base of whatever is selected,
-     * and pairing it with a different programme's ID is unconfirmed. dryLevel, the delay and
-     * loadItem fields did nothing in a download and are sent as 0, as the app does.
+     * dryLevel, the delay, loadItem and flags did nothing in a download and are sent as 0, as the
+     * app does.
      */
     private downloadCommand() {
-        const r = this.reported
-        if (r === undefined || r.selected === 0 || r.selected !== r.slot) {
-            this.log('ignoring download, the downloaded programme is not the selected one')
-            return undefined
-        }
+        const r = this.downloaded('download')
+        if (r === undefined) return undefined
         return Buffer.from([
             0xf0,
             0x25,
             0x03,
             0x15,
             r.course,
-            r.soil,
+            this.setting('soil')!,
             this.setting('spin')!,
             this.setting('temp')!,
             this.setting('rinse')!,
@@ -439,6 +487,43 @@ export default class Device extends AABBDevice {
             0, // flags
             0,
             r.slot,
+            0,
+            0,
+            0,
+        ])
+    }
+
+    /**
+     * F0 26 <course> <soilWash> <spin> <temp> <rinse> <dryLevel> <reserveH> <reserveM> <loadItem>
+     *       <options> <flags> 00 <smartCourse> 00 00 00
+     *
+     * The record F025 downloads, run. Confirmed with the downloaded Sweat Stain at 60 °C, 800 rpm
+     * and Rinse+, delayed by three hours: the appliance acknowledged it, went to Delayed with the
+     * delay left counting down in the status block, and took the rinse level from the packet over
+     * the one it had held. Layout and flags as on the sibling Y_V8_Y___W.B32QEUK.
+     *
+     * 0x03 is initialBit | remoteStart, which the sibling sends with every start. Only the
+     * downloaded programme has been seen running on this model, so that is all this runs.
+     */
+    private programmeCommand() {
+        const r = this.downloaded('run')
+        if (r === undefined) return undefined
+        return Buffer.from([
+            0xf0,
+            0x26,
+            r.course,
+            this.setting('soil')!,
+            this.setting('spin')!,
+            this.setting('temp')!,
+            this.setting('rinse')!,
+            0, // dryLevel
+            this.setting('delay_end')!,
+            0, // reserveTimeMinute: the panel only offers whole hours
+            0, // loadItemWasher
+            this.setting('options')!,
+            0x03, // initialBit | remoteStart
+            0,
+            r.selected,
             0,
             0,
             0,
@@ -461,13 +546,24 @@ export default class Device extends AABBDevice {
             const command = this.downloadCommand()
             if (command) this.send(command)
             // The appliance is the authority on what it holds now; drop the choices so the entities
-            // follow it again, which also shows a download it refused.
+            // follow it again, which also shows a download it refused. A delay is not part of a
+            // download, so it stays for the run.
+            for (const setting of ['soil', 'spin', 'temp', 'rinse', 'options']) this.pending.delete(setting)
+            this.publishSettings()
+            return
+        }
+
+        if (prop === 'run_programme') {
+            const command = this.programmeCommand()
+            if (command) this.send(command)
+            // As above, with the delay used up as well.
             this.pending.clear()
             this.publishSettings()
             return
         }
 
         const selects: Record<string, [string, Enum<string>]> = {
+            set_soil: ['soil', SETTABLE_SOILS],
             set_temp: ['temp', SETTABLE_TEMPERATURES],
             set_spin: ['spin', SETTABLE_SPINS],
             set_rinse: ['rinse', SETTABLE_RINSES],
@@ -476,6 +572,16 @@ export default class Device extends AABBDevice {
             const [setting, table] = selects[prop]
             const code = table.unmap(mqttValue)
             if (code !== undefined) this.pending.set(setting, code)
+            this.publishSettings()
+            return
+        }
+
+        if (prop === 'set_delay_end') {
+            const hours = Number(mqttValue)
+            // modelJson allows 3..19; 0 is how the panel expresses "no delayed end".
+            if (Number.isInteger(hours) && (hours === 0 || (hours >= 3 && hours <= 19))) {
+                this.pending.set('delay_end', hours)
+            }
             this.publishSettings()
             return
         }
