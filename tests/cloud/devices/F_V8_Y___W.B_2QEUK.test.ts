@@ -135,6 +135,18 @@ const PROGRAMME_DOWNLOADS: [string, string][] = [
     ['Swimming Wear', 'AA18F02503151B0302020100000000000000360000001DBB'],
 ]
 
+// The washer paused, with a delay waiting. First the downloaded Sweat Stain, which had been
+// started with a six hour delay; then Cotton, a dial course, started by the LG app with three.
+// Each was followed by the LG app's "cancel delay", which restarted the cycle at once.
+const PAUSED_DOWNLOADED_STATUS = buf(
+    'aa5420ec002504040304030100030506020006000042210001013b27003b00000500000000000000000000002502040304030100030506020006000042010004043b27003b00000500000000000000000000cdbb',
+)
+const PAUSED_DIAL_STATUS = buf(
+    'aa5420ec002504033a033a0100030a04010003000042210001010027003b00000000000000000000000000002502033a033a0100030a04010003000042010003040027003b00000400000000000000000000a4bb',
+)
+const CANCEL_DELAY_DOWNLOADED = 'AA16F0260103050602000000000002003B00000071BB'
+const CANCEL_DELAY_DIAL = 'AA16F02601030A04010000000000020000000000BEBB'
+
 // Downloads as above, 800 rpm and 60 °C, with one setting changed from the baseline's soil Normal
 // and Rinse+, as the washer then reported it.
 const DOWNLOAD_SOIL_INTENSIVE = 'AA18F02503150104050602000000000000003B00000069BB'
@@ -569,12 +581,51 @@ describe(MODEL_ID, () => {
             assert.equal(thinq.outbox.length, 0)
         })
 
-        test('nothing runs while the downloaded programme is not the selected one', () => {
+        test('a paused cycle is sent what the LG app sends to cancel its delay', () => {
             const { thinq, dev } = makeDevice()
-            thinq.emit('data', SAMPLE_COTTON_STD)
+            for (const [status, packet] of [
+                [PAUSED_DOWNLOADED_STATUS, CANCEL_DELAY_DOWNLOADED],
+                [PAUSED_DIAL_STATUS, CANCEL_DELAY_DIAL],
+            ] as const) {
+                thinq.emit('data', status)
+                thinq.resetRecorder()
+                dev.setProperty('cancel_delay', '')
+                assert.equal(lastSent(thinq), packet)
+            }
+        })
+
+        test('cancelling a delay sends what is reported, not what is staged', () => {
+            const { thinq, dev } = makeDevice()
+            thinq.emit('data', PAUSED_DIAL_STATUS)
+            dev.setProperty('set_spin', '800 rpm')
+            dev.setProperty('set_delay_end', '5')
             thinq.resetRecorder()
-            dev.setProperty('run_programme', '')
+            dev.setProperty('cancel_delay', '')
+            assert.equal(lastSent(thinq), CANCEL_DELAY_DIAL)
+        })
+
+        test('there is nothing to cancel, so nothing is sent, when no delay is waiting', () => {
+            const { thinq, dev } = makeDevice()
+            thinq.emit('data', DOWNLOADED_SWEAT_STAIN) // standby: sending would start a wash
+            thinq.resetRecorder()
+            dev.setProperty('cancel_delay', '')
             assert.equal(thinq.outbox.length, 0)
+        })
+
+        test('a paused cycle is sent the resume flags, with the delay that was staged', () => {
+            const { thinq, dev } = makeDevice()
+            thinq.emit('data', PAUSED_DIAL_STATUS)
+            thinq.resetRecorder()
+            dev.setProperty('set_delay_end', '0')
+            dev.setProperty('run_programme', '')
+            assert.equal(lastSent(thinq), CANCEL_DELAY_DIAL)
+
+            thinq.emit('data', PAUSED_DIAL_STATUS)
+            dev.setProperty('set_delay_end', '5')
+            dev.setProperty('run_programme', '')
+            const sent = thinq.outbox[thinq.outbox.length - 1]
+            assert.equal(sent[10], 5, 'the new delay')
+            assert.equal(sent[14], 0x02, 'resume flags, not the 0x03 of a start')
         })
     })
 })

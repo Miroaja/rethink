@@ -113,6 +113,7 @@ export default class Device extends AABBDevice {
         rinse: number
         options: number
         delay_end: number
+        status: number
         selected: number
         slot: number
     }
@@ -408,6 +409,14 @@ export default class Device extends AABBDevice {
                         name: 'Download programme',
                         icon: 'mdi:download-box-outline',
                     },
+                    cancel_delay: {
+                        platform: 'button',
+                        unique_id: '$deviceid-cancel_delay',
+                        command_topic: '$this/cancel_delay/set',
+                        payload_press: '',
+                        name: 'Cancel delay',
+                        icon: 'mdi:timer-off-outline',
+                    },
                     run_programme: {
                         platform: 'button',
                         unique_id: '$deviceid-run_programme',
@@ -488,6 +497,7 @@ export default class Device extends AABBDevice {
             rinse: extra_rinse,
             options,
             delay_end: time_reserve_hour,
+            status,
             selected: buf[22],
             slot: buf[25],
         }
@@ -593,41 +603,82 @@ export default class Device extends AABBDevice {
      * F0 26 <course> <soilWash> <spin> <temp> <rinse> <dryLevel> <reserveH> <reserveM> <loadItem>
      *       <options> <flags> 00 <smartCourse> 00 00 00
      *
-     * The record F025 downloads, run. Confirmed with the downloaded Sweat Stain at 60 °C, 800 rpm
-     * and Rinse+, delayed by three hours: the appliance acknowledged it, went to Delayed with the
-     * delay left counting down in the status block, and took the rinse level from the packet over
-     * the one it had held. Layout and flags as on the sibling Y_V8_Y___W.B32QEUK.
+     * The record F025 downloads, run. Confirmed with the LG app's own packets as well as ours: the
+     * downloaded Sweat Stain at 60 °C, 800 rpm and Rinse+, delayed by three hours, which the
+     * appliance acknowledged and took to Delayed with the delay left counting down in the status
+     * block; Cotton, a dial course with smartCourse 0, started with a three hour delay; and the
+     * same two records sent to a paused cycle with the delay cleared, which restarted it at once.
+     * Layout as on the sibling Y_V8_Y___W.B32QEUK.
      *
-     * 0x03 is initialBit | remoteStart, which the sibling sends with every start. Only the
-     * downloaded programme has been seen running on this model, so that is all this runs.
+     * flags is 0x03, initialBit | remoteStart, to start from standby, as the sibling sends it with
+     * every start. To a paused or delayed cycle the app sends 0x02 instead, and so does this. The
+     * smartCourse is the downloaded programme actually selected, 0 for a dial course.
      */
+    private programme(values: {
+        soil: number
+        spin: number
+        temp: number
+        rinse: number
+        options: number
+        delay_end: number
+    }) {
+        const r = this.reported
+        if (r === undefined || r.course === 0) {
+            this.log('ignoring run, the appliance has no course selected')
+            return undefined
+        }
+        const resuming = r.status === STATUS.unmap('Paused') || r.status === STATUS.unmap('Delayed')
+        return Buffer.from([
+            0xf0,
+            0x26,
+            r.course,
+            values.soil,
+            values.spin,
+            values.temp,
+            values.rinse,
+            0, // dryLevel
+            values.delay_end,
+            0, // reserveTimeMinute: the panel only offers whole hours
+            0, // loadItemWasher
+            values.options,
+            resuming ? 0x02 : 0x03,
+            0,
+            r.selected,
+            0,
+            0,
+            0,
+        ])
+    }
+
     private programmeCommand() {
         if (this.pending.has('programme')) {
             this.log('ignoring run, the chosen programme has not been downloaded')
             return undefined
         }
-        const target = this.downloaded('run')
-        if (target === undefined) return undefined
-        return Buffer.from([
-            0xf0,
-            0x26,
-            target.course,
-            this.setting('soil')!,
-            this.setting('spin')!,
-            this.setting('temp')!,
-            this.setting('rinse')!,
-            0, // dryLevel
-            this.setting('delay_end')!,
-            0, // reserveTimeMinute: the panel only offers whole hours
-            0, // loadItemWasher
-            this.setting('options')!,
-            0x03, // initialBit | remoteStart
-            0,
-            target.id,
-            0,
-            0,
-            0,
-        ])
+        return this.programme({
+            soil: this.setting('soil') ?? 0,
+            spin: this.setting('spin') ?? 0,
+            temp: this.setting('temp') ?? 0,
+            rinse: this.setting('rinse') ?? 0,
+            options: this.setting('options') ?? 0,
+            delay_end: this.setting('delay_end') ?? 0,
+        })
+    }
+
+    /**
+     * What the LG app sends for "cancel delay": the programme as the appliance reports it, with the
+     * delay cleared, sent to a paused cycle, which then runs at once. Sent to an appliance with no
+     * delay to cancel it would start one, so it is only sent while a delay is waiting. Delayed is
+     * included on the strength of the app offering it there; both of ours were paused.
+     */
+    private cancelDelayCommand() {
+        const r = this.reported
+        const waiting = r?.status === STATUS.unmap('Paused') || r?.status === STATUS.unmap('Delayed')
+        if (r === undefined || !waiting || r.delay_end === 0) {
+            this.log('ignoring cancel delay, no delay is waiting')
+            return undefined
+        }
+        return this.programme({ ...r, delay_end: 0 })
     }
 
     setProperty(prop: string, mqttValue: string) {
@@ -653,6 +704,12 @@ export default class Device extends AABBDevice {
                     this.pending.delete(setting)
                 this.publishSettings()
             }
+            return
+        }
+
+        if (prop === 'cancel_delay') {
+            const command = this.cancelDelayCommand()
+            if (command) this.send(command)
             return
         }
 
