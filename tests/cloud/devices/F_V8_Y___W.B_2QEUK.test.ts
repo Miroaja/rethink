@@ -98,6 +98,43 @@ const SPIN_1400_STATUS = buf(
 )
 const DOWNLOAD_SPIN_1400 = 'AA18F025031501030A0602000000000000003B00000015BB'
 
+// The washer's report after the download of Baby Care below, which replaced Sweat Stain in the slot.
+const BABY_CARE_STATUS = buf(
+    'aa5420ec002501040304030000000000000000000000010004000027003b000001000000000000000000000025010432043201000307060200000050000100050047270047000005000000000000000000000ebb',
+)
+
+// Every programme the LG app can download into this model, downloaded from the monitor to a unit
+// that had Sweat Stain at 800 rpm, 60 °C and Rinse+ selected. Each came back with its ID in the
+// status block and the name the LG app showed for it.
+const PROGRAMME_DOWNLOADS: [string, string][] = [
+    ['Baby Care', 'AA18F025031501030706020000000050000047000000CCBB'],
+    ['Blanket', 'AA18F02503150503020101000000000000003A00000060BB'],
+    ['Cold Wash', 'AA18F02503150103FF0101000000000000004D00000014BB'],
+    ['Colour Protection', 'AA18F02503152003050201000000000000003F0000000CBB'],
+    ['Drain', 'AA18F025031517000100000000000000000079000000D5BB'],
+    ['Gym Clothes', 'AA18F0250315080305010100000000000000380000006CBB'],
+    ['Hygiene', 'AA18F02503152D03FF06010000000080000048000000B8BB'],
+    ['Jeans', 'AA18F02503152003FF0201000000000000003900000018BB'],
+    ['Juice and Food Stains', 'AA18F02503150103070401000000004000006C000000FEBB'],
+    ['Kids Wear', 'AA18F02503150103090601000000004000003400000022BB'],
+    ['Lightly Soiled Items', 'AA18F02503151B03020201000000000000006500000022BB'],
+    ['Lingerie', 'AA18F02503152003050201000000000000004A00000031BB'],
+    ['Minimize Detergent Residue', 'AA18F02503150103FF040200000000000000660000000BBB'],
+    ['Minimize Wrinkles', 'AA18F02503150103FF0401000000000000006F00000033BB'],
+    ['Noise Minimize', 'AA18F02503150903070401000000000000004000000012BB'],
+    ['Quick Tub Clean', 'AA18F025031530030201000000000000000071000000C3BB'],
+    ['Rainy Season', 'AA18F02503150103FF040100000000000000370000007BBB'],
+    ['Rinse + Spin', 'AA18F02503150E03FF0001000000000000006400000031BB'],
+    ['School Uniform', 'AA18F02503150203070401000000000000003500000060BB'],
+    ['Single Garment', 'AA18F02503150C03020201000000000100003E00000017BB'],
+    ['Skin Care', 'AA18F02503150103FF0402000000001000004C00000001BB'],
+    ['Sleeve Hems and Collars', 'AA18F02503150103070601000000004000006B000000F9BB'],
+    ['Small Load', 'AA18F02503150C03020201000000000100004900000018BB'],
+    ['Spin', 'AA18F02503151700FF0000000000000000007A0000002ABB'],
+    ['Sweat Stain', 'AA18F02503150103FF0401000000000000003B00000067BB'],
+    ['Swimming Wear', 'AA18F02503151B0302020100000000000000360000001DBB'],
+]
+
 // Downloads as above, 800 rpm and 60 °C, with one setting changed from the baseline's soil Normal
 // and Rinse+, as the washer then reported it.
 const DOWNLOAD_SOIL_INTENSIVE = 'AA18F02503150104050602000000000000003B00000069BB'
@@ -385,6 +422,77 @@ describe(MODEL_ID, () => {
             dev.setProperty('set_spin', '1400 rpm')
             dev.setProperty('download_programme', '')
             assert.equal(lastSent(thinq), DOWNLOAD_SPIN_1400)
+        })
+
+        test('every programme downloads as it was downloaded to the unit', () => {
+            const { thinq, dev } = makeDevice()
+            assert.equal(PROGRAMME_DOWNLOADS.length, 26)
+            for (const [name, packet] of PROGRAMME_DOWNLOADS) {
+                thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+                thinq.resetRecorder()
+                dev.setProperty('set_smart_course', name)
+                dev.setProperty('download_programme', '')
+                assert.equal(lastSent(thinq), packet, name)
+            }
+        })
+
+        test('the downloaded course is read back by name, selected or not', () => {
+            const { ha, thinq } = makeDevice()
+            thinq.emit('data', BABY_CARE_STATUS)
+            assert.equal(ha.devices[DEVICE_ID].properties.smart_course, 'Baby Care')
+            assert.equal(ha.devices[DEVICE_ID].properties.set_smart_course, 'Baby Care')
+
+            thinq.emit('data', WOKEN_STATUS) // nothing selected, the slot still holds Sweat Stain
+            assert.equal(ha.devices[DEVICE_ID].properties.smart_course, 'Sweat Stain')
+
+            thinq.emit('data', EMPTY_SLOT_STATUS)
+            assert.equal(ha.devices[DEVICE_ID].properties.smart_course, 'None')
+        })
+
+        test('choosing a course stages its settings, and a later choice overrides one of them', () => {
+            const { ha, thinq, dev } = makeDevice()
+            thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+            dev.setProperty('set_smart_course', 'Baby Care') // 1000 rpm, 60 °C, Rinse+, pre-wash
+            assert.equal(ha.devices[DEVICE_ID].properties.set_spin, '1000 rpm')
+            assert.equal(ha.devices[DEVICE_ID].properties.set_prewash, 'ON')
+
+            dev.setProperty('set_spin', '800 rpm')
+            thinq.resetRecorder()
+            dev.setProperty('download_programme', '')
+            const sent = thinq.outbox[thinq.outbox.length - 1]
+            assert.equal(sent[8], 0x05, 'the spin chosen after the course')
+            assert.equal(sent[6], 0x01, 'Baby Care sits on Cotton')
+            assert.equal(sent[18], 0x47, 'and has its own ID')
+        })
+
+        test('nothing runs while a chosen course has not been downloaded', () => {
+            const { thinq, dev } = makeDevice()
+            thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+            dev.setProperty('set_smart_course', 'Baby Care')
+            thinq.resetRecorder()
+            dev.setProperty('run_programme', '')
+            assert.equal(thinq.outbox.length, 0)
+        })
+
+        test('a delay stays staged when the course in the slot changes', () => {
+            const { ha, thinq, dev } = makeDevice()
+            thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+            dev.setProperty('set_delay_end', '3')
+            dev.setProperty('set_smart_course', 'Baby Care')
+            dev.setProperty('download_programme', '')
+
+            thinq.emit('data', BABY_CARE_STATUS)
+            assert.equal(ha.devices[DEVICE_ID].properties.set_delay_end, 3)
+            assert.equal(ha.devices[DEVICE_ID].properties.set_smart_course, 'Baby Care')
+        })
+
+        test('a woken appliance takes a course chosen for it, whatever its base course', () => {
+            const { thinq, dev } = makeDevice()
+            thinq.emit('data', WOKEN_STATUS)
+            thinq.resetRecorder()
+            dev.setProperty('set_smart_course', 'Drain') // soil, temperature and rinse are all 0 for it
+            dev.setProperty('download_programme', '')
+            assert.equal(lastSent(thinq), PROGRAMME_DOWNLOADS.find(([name]) => name === 'Drain')![1])
         })
 
         test('nothing is sent before the appliance has reported', () => {

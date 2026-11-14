@@ -4,7 +4,7 @@ import { tombstone, type Connection } from '../homeassistant'
 import { type Metadata } from '../thinq'
 import { allowExtendedType } from '@/util/casting'
 import AABBDevice from './aabb_device'
-import { ERRORS, COURSES, TEMPERATURES, SPINS, SOIL_LEVELS, RINSES, SMART_COURSES } from './washer_common'
+import { ERRORS, COURSES, TEMPERATURES, SPINS, SOIL_LEVELS, RINSES } from './washer_common'
 import { Enum } from '@/util/enum'
 
 // Codes derived from modelJSON & observation of the LG app.
@@ -34,7 +34,15 @@ const STATUS = Enum.of({
 // lists only Normal and Rinse+ for the rinse and no choice at all for the soil. The rest is as
 // LG declares it. Max is sent as 255 and read back as 1400 rpm, the machine's top speed.
 const SETTABLE_TEMPERATURES = Enum.of({ Cold: 1, '20 °C': 2, '30 °C': 3, '40 °C': 4, '60 °C': 6, '95 °C': 7 })
-const SETTABLE_SPINS = Enum.of({ 'No spin': 1, '400 rpm': 2, '800 rpm': 5, '1000 rpm': 7, '1400 rpm': 10, Max: 255 })
+const SETTABLE_SPINS = Enum.of({
+    'No spin': 1,
+    '400 rpm': 2,
+    '800 rpm': 5,
+    '1000 rpm': 7,
+    '1200 rpm': 9,
+    '1400 rpm': 10,
+    Max: 255,
+})
 const SETTABLE_RINSES = Enum.of({ Normal: 1, 'Rinse+': 2, 'Rinse++': 3, 'Normal + Hold': 4, 'Rinse+ + Hold': 5 })
 const SETTABLE_SOILS = Enum.of({ TurboWash: 1, 'Time save': 2, Normal: 3, Intensive: 4 })
 
@@ -45,24 +53,52 @@ const OPTION_BITS: Record<string, number> = {
     steam: 0x80,
 }
 
-// Downloadable programmes that sit on the Cotton course according to modelJson, under the IDs the
-// shared SMART_COURSES table gives them. Sweat Stain and Cold Wash are the two seen in this model's
-// download slot.
-const COTTON = 0x01
-const COTTON_PROGRAMMES = new Set(
-    [
-        'Baby Care',
-        'Skin Care',
-        'Cold Wash',
-        'Kids Wear',
-        'Rainy Season',
-        'Sweat Stain',
-        'Minimize Wrinkles',
-        'Minimize Detergent Residue',
-        'Sleeve Hems and Collars',
-        'Juice and Food Stains',
-    ].flatMap((name) => SMART_COURSES.unmap(name) ?? []),
-)
+// The programmes the LG app can download into this model's slot, under the names and IDs of the
+// shared SMART_COURSES table. Each was downloaded to a unit, its ID read back from the status block
+// and the name the LG app showed for it noted: all 26 agreed with the table. The settings are the
+// defaults modelJson gives each programme, and the base course is the one it names. The base
+// courses off Cotton are the sibling Y_V8_Y___W.B32QEUK's; the washer took them as sent and its
+// time estimates followed them, from 14 minutes for Single Garment to a minute for Drain.
+const PROGRAMMES = [
+    { name: 'Baby Care', id: 0x47, course: 0x01, soil: 3, spin: 7, temp: 6, rinse: 2, options: 0x50 },
+    { name: 'Blanket', id: 0x3a, course: 0x05, soil: 3, spin: 2, temp: 1, rinse: 1, options: 0x00 },
+    { name: 'Cold Wash', id: 0x4d, course: 0x01, soil: 3, spin: 255, temp: 1, rinse: 1, options: 0x00 },
+    { name: 'Colour Protection', id: 0x3f, course: 0x20, soil: 3, spin: 5, temp: 2, rinse: 1, options: 0x00 },
+    { name: 'Drain', id: 0x79, course: 0x17, soil: 0, spin: 1, temp: 0, rinse: 0, options: 0x00 },
+    { name: 'Gym Clothes', id: 0x38, course: 0x08, soil: 3, spin: 5, temp: 1, rinse: 1, options: 0x00 },
+    { name: 'Hygiene', id: 0x48, course: 0x2d, soil: 3, spin: 255, temp: 6, rinse: 1, options: 0x80 },
+    { name: 'Jeans', id: 0x39, course: 0x20, soil: 3, spin: 255, temp: 2, rinse: 1, options: 0x00 },
+    { name: 'Juice and Food Stains', id: 0x6c, course: 0x01, soil: 3, spin: 7, temp: 4, rinse: 1, options: 0x40 },
+    { name: 'Kids Wear', id: 0x34, course: 0x01, soil: 3, spin: 9, temp: 6, rinse: 1, options: 0x40 },
+    { name: 'Lightly Soiled Items', id: 0x65, course: 0x1b, soil: 3, spin: 2, temp: 2, rinse: 1, options: 0x00 },
+    { name: 'Lingerie', id: 0x4a, course: 0x20, soil: 3, spin: 5, temp: 2, rinse: 1, options: 0x00 },
+    {
+        name: 'Minimize Detergent Residue',
+        id: 0x66,
+        course: 0x01,
+        soil: 3,
+        spin: 255,
+        temp: 4,
+        rinse: 2,
+        options: 0x00,
+    },
+    { name: 'Minimize Wrinkles', id: 0x6f, course: 0x01, soil: 3, spin: 255, temp: 4, rinse: 1, options: 0x00 },
+    { name: 'Noise Minimize', id: 0x40, course: 0x09, soil: 3, spin: 7, temp: 4, rinse: 1, options: 0x00 },
+    { name: 'Quick Tub Clean', id: 0x71, course: 0x30, soil: 3, spin: 2, temp: 1, rinse: 0, options: 0x00 },
+    { name: 'Rainy Season', id: 0x37, course: 0x01, soil: 3, spin: 255, temp: 4, rinse: 1, options: 0x00 },
+    { name: 'Rinse + Spin', id: 0x64, course: 0x0e, soil: 3, spin: 255, temp: 0, rinse: 1, options: 0x00 },
+    { name: 'School Uniform', id: 0x35, course: 0x02, soil: 3, spin: 7, temp: 4, rinse: 1, options: 0x00 },
+    { name: 'Single Garment', id: 0x3e, course: 0x0c, soil: 3, spin: 2, temp: 2, rinse: 1, options: 0x01 },
+    { name: 'Skin Care', id: 0x4c, course: 0x01, soil: 3, spin: 255, temp: 4, rinse: 2, options: 0x10 },
+    { name: 'Sleeve Hems and Collars', id: 0x6b, course: 0x01, soil: 3, spin: 7, temp: 6, rinse: 1, options: 0x40 },
+    { name: 'Small Load', id: 0x49, course: 0x0c, soil: 3, spin: 2, temp: 2, rinse: 1, options: 0x01 },
+    { name: 'Spin', id: 0x7a, course: 0x17, soil: 0, spin: 255, temp: 0, rinse: 0, options: 0x00 },
+    { name: 'Sweat Stain', id: 0x3b, course: 0x01, soil: 3, spin: 255, temp: 4, rinse: 1, options: 0x00 },
+    { name: 'Swimming Wear', id: 0x36, course: 0x1b, soil: 3, spin: 2, temp: 2, rinse: 1, options: 0x00 },
+]
+const PROGRAMME_NAMES = new Enum<string>(PROGRAMMES.map((p) => [p.name, p.id]))
+const PROGRAMME_BY_ID = new Map(PROGRAMMES.map((p) => [p.id, p]))
+const PROGRAMME_BY_NAME = new Map(PROGRAMMES.map((p) => [p.name, p]))
 
 export default class Device extends AABBDevice {
     // F025 downloads a programme into the appliance's single download slot and F026 runs one. Both
@@ -300,6 +336,24 @@ export default class Device extends AABBDevice {
                         icon: 'mdi:water',
                         options: SETTABLE_RINSES.options,
                     },
+                    smart_course: {
+                        platform: 'sensor',
+                        unique_id: '$deviceid-smart_course',
+                        state_topic: '$this/smart_course',
+                        name: 'Downloaded course',
+                        icon: 'mdi:cloud-download-outline',
+                        device_class: 'enum',
+                        options: PROGRAMME_NAMES.options,
+                    },
+                    set_smart_course: {
+                        platform: 'select',
+                        unique_id: '$deviceid-set_smart_course',
+                        state_topic: '$this/set_smart_course',
+                        command_topic: '$this/set_smart_course/set',
+                        name: 'Set downloaded course',
+                        icon: 'mdi:tune-vertical',
+                        options: PROGRAMME_NAMES.options,
+                    },
                     set_soil: {
                         platform: 'select',
                         unique_id: '$deviceid-set_soil',
@@ -413,13 +467,18 @@ export default class Device extends AABBDevice {
         this.publishProperty('steam', options & 0x80 ? 'ON' : 'OFF')
         this.publishProperty('soil', SOIL_LEVELS.map(soil))
         this.publishProperty('rinse', RINSES.map(extra_rinse))
+        // buf[25] is the programme in the slot, which buf[22] shows only while it is selected.
+        this.publishProperty('smart_course', PROGRAMME_NAMES.map(buf[25]))
 
         // buf[22] is the downloaded programme actually selected, buf[25] the one in the download slot.
         // Choices staged for one programme mean nothing for another, so a different programme being
-        // selected, or loaded into the slot, drops them.
+        // selected, or loaded into the slot, drops them. A delay is a time, not a setting of the
+        // programme, so it stays.
         const previous = this.reported
         if (previous && (previous.course !== course || previous.selected !== buf[22] || previous.slot !== buf[25])) {
+            const delay = this.pending.get('delay_end')
             this.pending.clear()
+            if (delay !== undefined) this.pending.set('delay_end', delay)
         }
         this.reported = {
             course,
@@ -453,6 +512,8 @@ export default class Device extends AABBDevice {
         this.publishProperty('set_spin', spin === undefined ? undefined : SETTABLE_SPINS.map(spin))
         this.publishProperty('set_rinse', rinse === undefined ? undefined : SETTABLE_RINSES.map(rinse))
         this.publishProperty('set_delay_end', this.setting('delay_end'))
+        const programme = this.pending.get('programme') ?? this.reported?.slot
+        this.publishProperty('set_smart_course', programme === undefined ? undefined : PROGRAMME_NAMES.map(programme))
         for (const [name, bit] of Object.entries(OPTION_BITS)) {
             this.publishProperty(`set_${name}`, (options ?? 0) & bit ? 'ON' : 'OFF')
         }
@@ -461,17 +522,17 @@ export default class Device extends AABBDevice {
     /**
      * The course and ID to put in a record, if the downloaded programme is one the commands below
      * may describe. Normally that is the programme the appliance has selected, whose base course it
-     * reports. A freshly woken appliance reports no selection and no settings, and selects the
-     * downloaded programme when one arrives; its base course is then known only for the Cotton
-     * based programmes, which is all `woken` lets through. Pairing a course with another
-     * programme's ID is unconfirmed.
+     * reports. A freshly woken appliance reports no course and no settings, and selects the
+     * downloaded programme when one arrives; its base course then comes from the table above,
+     * which is all `woken` lets through. Pairing a course with another programme's ID is
+     * unconfirmed.
      */
     private downloaded(what: string, woken = false) {
         const r = this.reported
         if (r !== undefined && r.selected !== 0 && r.selected === r.slot) return { course: r.course, id: r.slot }
-        if (r !== undefined && woken && r.selected === 0 && COTTON_PROGRAMMES.has(r.slot)) {
-            return { course: COTTON, id: r.slot }
-        }
+        const known =
+            r !== undefined && woken && r.selected === 0 && r.course === 0 ? PROGRAMME_BY_ID.get(r.slot) : undefined
+        if (known) return { course: known.course, id: known.id }
         this.log(`ignoring ${what}, the downloaded programme is not the selected one`)
         return undefined
     }
@@ -490,14 +551,17 @@ export default class Device extends AABBDevice {
      * app does.
      */
     private downloadCommand() {
-        const target = this.downloaded('download', true)
+        // A programme chosen through set_smart_course brings its base course and its own settings.
+        const chosen = PROGRAMME_BY_ID.get(this.pending.get('programme') ?? 0)
+        const target = chosen ? { course: chosen.course, id: chosen.id } : this.downloaded('download', true)
         if (target === undefined) return undefined
-        const soil = this.setting('soil')
-        const spin = this.setting('spin')
-        const temp = this.setting('temp')
-        const rinse = this.setting('rinse')
-        // 0 is what an appliance that has just woken reports for each of these: no choice made.
-        if (!soil || !spin || !temp || !rinse) {
+        const soil = this.setting('soil') ?? 0
+        const spin = this.setting('spin') ?? 0
+        const temp = this.setting('temp') ?? 0
+        const rinse = this.setting('rinse') ?? 0
+        // 0 is what an appliance that has just woken reports for each of these: no choice made. A
+        // chosen programme has zeros of its own, such as Drain's.
+        if (!chosen && (!soil || !spin || !temp || !rinse)) {
             this.log('ignoring download, a setting is neither reported nor chosen')
             return undefined
         }
@@ -515,7 +579,7 @@ export default class Device extends AABBDevice {
             0, // reserveTimeHour
             0, // reserveTimeMinute
             0, // loadItemWasher
-            this.setting('options')!,
+            this.setting('options') ?? 0,
             0, // flags
             0,
             target.id,
@@ -538,6 +602,10 @@ export default class Device extends AABBDevice {
      * downloaded programme has been seen running on this model, so that is all this runs.
      */
     private programmeCommand() {
+        if (this.pending.has('programme')) {
+            this.log('ignoring run, the chosen programme has not been downloaded')
+            return undefined
+        }
         const target = this.downloaded('run')
         if (target === undefined) return undefined
         return Buffer.from([
@@ -581,7 +649,8 @@ export default class Device extends AABBDevice {
                 // The appliance is the authority on what it holds now; drop the choices so the entities
                 // follow it again, which also shows a download it ignored. A delay is not part of a
                 // download, so it stays for the run. A refused download leaves everything staged.
-                for (const setting of ['soil', 'spin', 'temp', 'rinse', 'options']) this.pending.delete(setting)
+                for (const setting of ['programme', 'soil', 'spin', 'temp', 'rinse', 'options'])
+                    this.pending.delete(setting)
                 this.publishSettings()
             }
             return
@@ -608,6 +677,18 @@ export default class Device extends AABBDevice {
             const [setting, table] = selects[prop]
             const code = table.unmap(mqttValue)
             if (code !== undefined) this.pending.set(setting, code)
+            this.publishSettings()
+            return
+        }
+
+        if (prop === 'set_smart_course') {
+            const programme = PROGRAMME_BY_NAME.get(mqttValue)
+            if (programme) {
+                this.pending.set('programme', programme.id)
+                for (const setting of ['soil', 'spin', 'temp', 'rinse', 'options'] as const) {
+                    this.pending.set(setting, programme[setting])
+                }
+            }
             this.publishSettings()
             return
         }
