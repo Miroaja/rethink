@@ -28,11 +28,9 @@ const STATUS = Enum.of({
     Error: 18,
 })
 
-// What the Cotton course (the base of the downloadable programmes seen so far) offers in this
-// model's modelJson, under the labels the sensors above already use. 800 rpm, Max, 40 and 60 °C
-// were confirmed on a unit, as was every rinse and soil level below, although the modelJson
-// lists only Normal and Rinse+ for the rinse and no choice at all for the soil. The rest is as
-// LG declares it. Max is sent as 255 and read back as 1400 rpm, the machine's top speed.
+// Selectable values: Cotton's lists from modelJson, plus the soil and rinse levels and the 1200 and
+// 1400 rpm steps confirmed on a unit. Max is sent as 255 and read back as 1400 rpm. The washer also
+// stores values outside these lists, which does not show that it supports them.
 const SETTABLE_TEMPERATURES = Enum.of({ Cold: 1, '20 °C': 2, '30 °C': 3, '40 °C': 4, '60 °C': 6, '95 °C': 7 })
 const SETTABLE_SPINS = Enum.of({
     'No spin': 1,
@@ -53,12 +51,9 @@ const OPTION_BITS: Record<string, number> = {
     steam: 0x80,
 }
 
-// The programmes the LG app can download into this model's slot, under the names and IDs of the
-// shared SMART_COURSES table. Each was downloaded to a unit, its ID read back from the status block
-// and the name the LG app showed for it noted: all 26 agreed with the table. The settings are the
-// defaults modelJson gives each programme, and the base course is the one it names. The base
-// courses off Cotton are the sibling Y_V8_Y___W.B32QEUK's; the washer took them as sent and its
-// time estimates followed them, from 14 minutes for Single Garment to a minute for Drain.
+// The programmes the LG app downloads into the slot: the IDs of SMART_COURSES, and the base course
+// and settings modelJson gives each. All 26 IDs were checked against the names the LG app showed.
+// The base courses off Cotton are the sibling Y_V8_Y___W.B32QEUK's.
 const PROGRAMMES = [
     { name: 'Baby Care', id: 0x47, course: 0x01, soil: 3, spin: 7, temp: 6, rinse: 2, options: 0x50 },
     { name: 'Blanket', id: 0x3a, course: 0x05, soil: 3, spin: 2, temp: 1, rinse: 1, options: 0x00 },
@@ -479,10 +474,8 @@ export default class Device extends AABBDevice {
         // buf[25] is the programme in the slot, which buf[22] shows only while it is selected.
         this.publishProperty('smart_course', PROGRAMME_NAMES.map(buf[25]))
 
-        // buf[22] is the downloaded programme actually selected, buf[25] the one in the download slot.
-        // Choices staged for one programme mean nothing for another, so a different programme being
-        // selected, or loaded into the slot, drops them. A delay is a time, not a setting of the
-        // programme, so it stays.
+        // buf[22] is the downloaded programme selected, buf[25] the one in the slot. Choices staged for
+        // another programme are dropped; a delay is not a programme setting and stays.
         const previous = this.reported
         if (previous && (previous.course !== course || previous.selected !== buf[22] || previous.slot !== buf[25])) {
             const delay = this.pending.get('delay_end')
@@ -530,12 +523,9 @@ export default class Device extends AABBDevice {
     }
 
     /**
-     * The course and ID to put in a record, if the downloaded programme is one the commands below
-     * may describe. Normally that is the programme the appliance has selected, whose base course it
-     * reports. A freshly woken appliance reports no course and no settings, and selects the
-     * downloaded programme when one arrives; its base course then comes from the table above,
-     * which is all `woken` lets through. Pairing a course with another programme's ID is
-     * unconfirmed.
+     * The course and ID for a record: normally the selected downloaded programme, with the base
+     * course the appliance reports. A freshly woken appliance reports no course, and `woken` then
+     * takes the base from the programme table.
      */
     private downloaded(what: string, woken = false) {
         const r = this.reported
@@ -551,14 +541,9 @@ export default class Device extends AABBDevice {
      * F0 25 03 15 <course> <soilWash> <spin> <temp> <rinse> <dryLevel> <reserveH> <reserveM>
      *             <loadItem> <options> <flags> 00 <smartCourse> 00 00 00
      *
-     * The record after 03 15 is the one F026 carries to start a programme. Confirmed against a
-     * download issued from the LG app (Sweat Stain, whose course, soilWash, spin, temp and rinse
-     * bytes are modelJson's defaults for it), and by changing each setting from HA and reading
-     * the status block back. 03 15 is the download type and the data length from modelJson's
-     * WMDownload; the length is not the 16 bytes that follow, and is sent as the app sends it.
-     *
-     * dryLevel, the delay, loadItem and flags did nothing in a download and are sent as 0, as the
-     * app does.
+     * The record is the one F026 carries. 03 15 is the download type and the data length from
+     * modelJson's WMDownload; the length is not the 16 bytes that follow, and is sent as the LG app
+     * sends it. dryLevel, the delay, loadItem and flags have no effect in a download.
      */
     private downloadCommand() {
         // A programme chosen through set_smart_course brings its base course and its own settings.
@@ -603,16 +588,9 @@ export default class Device extends AABBDevice {
      * F0 26 <course> <soilWash> <spin> <temp> <rinse> <dryLevel> <reserveH> <reserveM> <loadItem>
      *       <options> <flags> 00 <smartCourse> 00 00 00
      *
-     * The record F025 downloads, run. Confirmed with the LG app's own packets as well as ours: the
-     * downloaded Sweat Stain at 60 °C, 800 rpm and Rinse+, delayed by three hours, which the
-     * appliance acknowledged and took to Delayed with the delay left counting down in the status
-     * block; Cotton, a dial course with smartCourse 0, started with a three hour delay; and the
-     * same two records sent to a paused cycle with the delay cleared, which restarted it at once.
-     * Layout as on the sibling Y_V8_Y___W.B32QEUK.
-     *
-     * flags is 0x03, initialBit | remoteStart, to start from standby, as the sibling sends it with
-     * every start. To a paused or delayed cycle the app sends 0x02 instead, and so does this. The
-     * smartCourse is the downloaded programme actually selected, 0 for a dial course.
+     * The F025 record, run. flags is 0x03 (initialBit | remoteStart) to start from standby, as on the
+     * sibling Y_V8_Y___W.B32QEUK, and 0x02 to a paused or delayed cycle, as the LG app sends it.
+     * smartCourse is the selected downloaded programme, 0 for a dial course.
      */
     private programme(values: {
         soil: number
@@ -666,10 +644,9 @@ export default class Device extends AABBDevice {
     }
 
     /**
-     * What the LG app sends for "cancel delay": the programme as the appliance reports it, with the
-     * delay cleared, sent to a paused cycle, which then runs at once. Sent to an appliance with no
-     * delay to cancel it would start one, so it is only sent while a delay is waiting. Delayed is
-     * included on the strength of the app offering it there; both of ours were paused.
+     * The LG app's "cancel delay": the programme as reported, with the delay cleared, sent to a
+     * paused cycle. From standby the same packet would start a wash, so it is sent only while a
+     * delay is waiting.
      */
     private cancelDelayCommand() {
         const r = this.reported
@@ -697,9 +674,8 @@ export default class Device extends AABBDevice {
             const command = this.downloadCommand()
             if (command) {
                 this.send(command)
-                // The appliance is the authority on what it holds now; drop the choices so the entities
-                // follow it again, which also shows a download it ignored. A delay is not part of a
-                // download, so it stays for the run. A refused download leaves everything staged.
+                // The appliance now decides what it holds; drop the choices so the entities follow it.
+                // A delay is not part of a download and stays for the run.
                 for (const setting of ['programme', 'soil', 'spin', 'temp', 'rinse', 'options'])
                     this.pending.delete(setting)
                 this.publishSettings()
