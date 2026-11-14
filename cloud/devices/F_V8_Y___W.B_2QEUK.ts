@@ -32,9 +32,9 @@ const STATUS = Enum.of({
 // model's modelJson, under the labels the sensors above already use. 800 rpm, Max, 40 and 60 °C
 // were confirmed on a unit, as was every rinse and soil level below, although the modelJson
 // lists only Normal and Rinse+ for the rinse and no choice at all for the soil. The rest is as
-// LG declares it.
+// LG declares it. Max is sent as 255 and read back as 1400 rpm, the machine's top speed.
 const SETTABLE_TEMPERATURES = Enum.of({ Cold: 1, '20 °C': 2, '30 °C': 3, '40 °C': 4, '60 °C': 6, '95 °C': 7 })
-const SETTABLE_SPINS = Enum.of({ 'No spin': 1, '400 rpm': 2, '800 rpm': 5, '1000 rpm': 7, Max: 255 })
+const SETTABLE_SPINS = Enum.of({ 'No spin': 1, '400 rpm': 2, '800 rpm': 5, '1000 rpm': 7, '1400 rpm': 10, Max: 255 })
 const SETTABLE_RINSES = Enum.of({ Normal: 1, 'Rinse+': 2, 'Rinse++': 3, 'Normal + Hold': 4, 'Rinse+ + Hold': 5 })
 const SETTABLE_SOILS = Enum.of({ TurboWash: 1, 'Time save': 2, Normal: 3, Intensive: 4 })
 

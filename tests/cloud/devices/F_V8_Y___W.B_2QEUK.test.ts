@@ -91,6 +91,13 @@ const EMPTY_SLOT_STATUS = buf(
     'aa5420ec002500040304030000000000000000000000010004010027003b0000010000000000000000000000250000000000000000000000000000000000000001000000000000000000000000000000000099bb',
 )
 
+// The washer reporting 1400 rpm, which is what it reports for Max as well, after a download
+// that changed the spin from 1200 rpm; and the download that set it.
+const SPIN_1400_STATUS = buf(
+    'aa5420ec002501040d040d0100030906020000000000010004003b27003b00000500000000000000000000002501041004100100030a06020000000000010004003b27003b0000050000000000000000c0008cbb',
+)
+const DOWNLOAD_SPIN_1400 = 'AA18F025031501030A0602000000000000003B00000015BB'
+
 // Downloads as above, 800 rpm and 60 °C, with one setting changed from the baseline's soil Normal
 // and Rinse+, as the washer then reported it.
 const DOWNLOAD_SOIL_INTENSIVE = 'AA18F02503150104050602000000000000003B00000069BB'
@@ -365,6 +372,19 @@ describe(MODEL_ID, () => {
             dev.setProperty('set_rinse', 'Rinse+')
             dev.setProperty('download_programme', '')
             assert.equal(thinq.outbox.length, 0)
+        })
+
+        test('the 1400 rpm the washer reports for Max is offered back and sent as it was set', () => {
+            const { ha, thinq, dev } = makeDevice()
+            thinq.emit('data', SPIN_1400_STATUS)
+            assert.equal(ha.devices[DEVICE_ID].properties.spin, '1400 rpm')
+            assert.equal(ha.devices[DEVICE_ID].properties.set_spin, '1400 rpm')
+
+            thinq.emit('data', DOWNLOADED_SWEAT_STAIN)
+            thinq.resetRecorder()
+            dev.setProperty('set_spin', '1400 rpm')
+            dev.setProperty('download_programme', '')
+            assert.equal(lastSent(thinq), DOWNLOAD_SPIN_1400)
         })
 
         test('nothing is sent before the appliance has reported', () => {
